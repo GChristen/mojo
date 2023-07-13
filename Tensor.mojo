@@ -2,7 +2,7 @@
 from Vector import DynamicVector
 from Math import sqrt, exp
 from String import String
-from List import VariadicList, DimList, Dim
+from List import VariadicList
 from Buffer import Buffer, NDBuffer
 from DType import DType
 from Pointer import DTypePointer
@@ -11,6 +11,8 @@ from Memory import memset_zero, memcpy
 from Reductions import variance, mean
 from TargetInfo import simdwidthof
 from IO import print_no_newline
+from Assert import debug_assert
+from Functional import vectorize
 
 #Helper functions. These functions smell, it would be good to remove these
 #What to do with these functions - they smell
@@ -131,6 +133,10 @@ struct Tensor[type: DType]:
         return x
             
     @staticmethod
+    fn zeros(*dims: Int) -> Self:
+        return Self(VariadicList[Int](dims)) #by default the values are set to 0
+
+    @staticmethod
     fn zeros(shape:VariadicList[Int]) -> Self:
         return Self(shape) #by default the values are set to 0
 
@@ -220,14 +226,11 @@ struct Tensor[type: DType]:
                 out = out + "\n"  # Move to the next line after printing the last element of a dimension
     
     
-    fn show(self, summary: Bool = True):
+    fn show(self, summary: Bool = False):
         #print summary
         if summary:
             #shape            
-            print_no_newline ("Shape: ")
-            for i in range(len(self.shape)):
-                print_no_newline(self.shape[i], ", ")
-            print_no_newline("]\n")
+            print("Shape: ", __vector_to_string(self.shape))
             #rank
             print("Rank: ", self.rank)
             #size
@@ -243,34 +246,91 @@ struct Tensor[type: DType]:
         self.print_tensor_recursive(0, indices, out) 
         print(out)        
     
+    ### Simple operators (add, sub, mul, exp, pow)                    
+    fn __imul__(inout self: Self, rhs: Int):
+        alias nelts: Int = simdwidthof[type]()
+        @parameter
+        fn op[opsize: Int](n : Int):
+            self.store[opsize](__idx(n), self.load[opsize](__idx(n)) * rhs)
+        vectorize[nelts, op](self.size)
+        
+    fn __mul__(self: Self, rhs: Int) -> Self:
+        var x = self
+        x*=rhs
+        return x
+   
+    #layout is N, C, H, W
+    fn __mul__(self: Self, rhs: Self) -> Self:
+        alias nelts: Int = simdwidthof[type]()
+        
+        #consider changing rank to len (safer)
+        if rhs.rank == 1:            
+            if self.rank == 1: #what about colum vectors? rank 2
+                if self.size != rhs.size: print("Shapes not aligned")
+                var result = Tensor[type].zeros(self.shape[0])
+                @parameter
+                fn op[opsize: Int](n : Int):
+                    let product = self.load[opsize](__idx(n)) * rhs.load[opsize](__idx(n))
+                    result.store[opsize](__idx(n), product)
+                vectorize[nelts, op](self.size)
+                return result
+        
+        #temp catch all
+        return Tensor[type].zeros(1)
     
+    #layout is N, C, H, W
+    fn dot(self: Self, rhs: Self) -> Self:
+        alias nelts: Int = simdwidthof[type]()
+        #add shape checks here        
+        
+        #consider changing rank to len (safer)
+        if rhs.rank == 1:            
+            if self.rank == 1: #what about colum vectors? rank 2
+                var result = Tensor[type].zeros(1)
+                @parameter
+                fn op[opsize: Int](n : Int):
+                    let product = self.load[opsize](__idx(n)) * rhs.load[opsize](__idx(n))
+                    result.store[1](__idx(0), result.load[1](0) + (product.reduce_add()))
+                vectorize[nelts, op](self.size)
+                return result
+            
+        return Tensor[type].zeros(1)
+    
+    fn __iadd__(inout self: Self, rhs: Int):
+        alias nelts: Int = simdwidthof[type]()
+        @parameter
+        fn op[opsize: Int](n : Int):
+            self.store[opsize](__idx(n), self.load[opsize](__idx(n)) + rhs)
+        vectorize[nelts, op](self.size)
+    
+    fn __add__(self: Self, rhs: Int) -> Self:
+        var x = self
+        x+=rhs
+        return x
+
+    fn __isub__(inout self: Self, rhs: Int):
+        alias nelts: Int = simdwidthof[type]()
+        @parameter
+        fn op[opsize: Int](n : Int):
+            self.store[opsize](__idx(n), self.load[opsize](__idx(n)) - rhs)
+        vectorize[nelts, op](self.size)
+    
+    fn __sub__(self: Self, rhs: Int) -> Self:
+        var x = self
+        x-=rhs
+        return x
+
+    fn __itruediv__(inout self: Self, rhs: Int):
+        alias nelts: Int = simdwidthof[type]()
+        @parameter
+        fn op[opsize: Int](n : Int):
+            self.store[opsize](__idx(n), self.load[opsize](__idx(n)) / rhs)
+        vectorize[nelts, op](self.size)
+    
+    fn __truediv__(self: Self, rhs: Int) -> Self:
+        var x = self
+        x/=rhs
+        return x    
     ### Reduce ops
     
     ### NN Ops
-    
-    ### General SIMD functions, is there a single one of these
-    fn simd_int_op[nelts: Int](inout self: Self, rhs: Int,
-                   op_simd: fn(SIMD[type, nelts], Int)->SIMD[type, nelts],
-                   op_single: fn(SIMD[type, 1], Int)->SIMD[type, 1]):
-        let num_iter = self.size // nelts
-
-        #fill by nelts steps
-        for i in range(num_iter):
-            let idx = __idx(nelts*i)
-            self.store[nelts](idx, op_simd(self.load[nelts](idx), rhs) )     
-        
-        #fill remainder
-        for i in range(nelts*(self.size//nelts), self.size):
-            #can't yet use *int in setItem
-            self[__idx(i)]= op_single(self[i], rhs)                          
-            
-    @staticmethod
-    fn mul[opsize: Int](m: SIMD[type, opsize], v: Int)->SIMD[type, opsize]:
-        return m*v
-            
-    fn __imul__(inout self: Self, rhs: Int):
-        alias nelts: Int = simdwidthof[type]()
-        self.simd_int_op[nelts](rhs, Tensor[type].mul[nelts], Tensor[type].mul[1])
-
-
-    
