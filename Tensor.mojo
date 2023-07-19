@@ -1,6 +1,6 @@
 #cant do import, need to do from import
 from Vector import DynamicVector
-from Math import sqrt, exp, max, mul
+from Math import sqrt, exp, max, mul, add, sub
 from String import String
 from List import VariadicList
 from Buffer import Buffer, NDBuffer
@@ -14,6 +14,8 @@ from IO import print_no_newline
 from Assert import debug_assert
 from Functional import vectorize
 from Intrinsics import strided_load
+from TypeUtilities import rebind
+
 
 #Helper functions. These functions smell, it would be good to remove these
 
@@ -233,6 +235,7 @@ struct Tensor[type: DType]:
         return self.index_to_offset(index_vector)
     
     ### Display Ops
+    ### Refactor to use op_over_dimension
     fn print_tensor_recursive(self, dim: Int, inout indices: DynamicVector[Int], inout out: String):
         #Tons of potential issues here: recursion, print one at a time, etc
         if dim == len(self.shape):  # Base case: reached the innermost dimension
@@ -268,36 +271,23 @@ struct Tensor[type: DType]:
         print(out)        
     
     ### Operators (add, sub, mul, exp, pow)                    
-    fn __imul__(inout self: Self, rhs: SIMD[type,1]):
-        alias nelts: Int = simdwidthof[type]()
-        @parameter
-        fn op[opsize: Int](n : Int):
-            self.store[opsize](__idx(n), self.load[opsize](__idx(n)) * rhs)
-        vectorize[nelts, op](self.size)
-        
-    fn __mul__(self: Self, rhs: SIMD[type,1]) -> Self:
-        var x = self
-        x*=rhs
-        return x
     
     #layout is N, C, H, W
-    #Behaviour:
-    # Computes hadamard product (https://en.wikipedia.org/wiki/Hadamard_product_(matrices))
+    # Computes Self ☉ rhs (https://en.wikipedia.org/wiki/Hadamard_product_(matrices))
     #TODO
     # - Important: shape cheks to raise errors
     # - Add func name to error messages
     # - [done] matrix . matrix mul (rhs.rank==2)
-    # - matrix . scalar (or Tensor scalar)
     # - later: implement for column vectors (2,1) or (1,1,1,X) shapes 
     fn __mul__(self: Self, rhs: Self) -> Self:
         alias nelts: Int = simdwidthof[type]()
         let lhs_last_shape = self.shape[len(self.shape)-1]
         let rhs_last_shape = rhs.shape[len(rhs.shape)-1]        
                 
-        #element wise * with a vector
+        #self ☉ vec
         if rhs.rank == 1:
             if not(lhs_last_shape == rhs_last_shape): print("Shapes not aligned:", lhs_last_shape, rhs_last_shape)
-            #self is a vec, so op is a vec * vec
+            #vec * vec
             if self.rank == 1: 
                 var result = Tensor[type].zeros(self.shape[0])
                 @parameter
@@ -306,26 +296,13 @@ struct Tensor[type: DType]:
                     result.store[opsize](__idx(n), product)
                 vectorize[nelts, rowmul_11](self.size)
                 return result
-            #self is any tensor in >= 2R
+            #tensor(>= 2R) ☉ vec
             else:
-                #resulting tensor should be same shape as self
                 var result = Tensor[type](self.shape)
                                 
-                #init running index to 0,...,0 for shape
-                var indices = self.shape.deepcopy()
-                for i in range(len(indices)): indices[i] = 0
-                
-                var last_dim_index = len(self.shape) - 2
-
-                #loop through the starting index for every row in this tensor, and multiply w/ rhs vector
-                while True: #really don't like 'while true', but don't want to do this recursively
-                    #reached the end of the first dimension, done looping through all dims
-                    if (self.shape[0]-1 <  indices[0]):
-                        break    
-
-                    #get the stride
+                fn vec_mul(indices: DynamicVector[Int]):
+                    #get the stride and offset for this row
                     let stride = __get_dim_product(self.shape, self.rank-1)
-                    #get the offset - the location of the start of this row
                     let offset = self.index_to_offset(indices)
                     
                     #vectorize a strided load (row), multiply w/ rhs(vector), and do strided_store
@@ -336,35 +313,18 @@ struct Tensor[type: DType]:
                         let product = mul[type, opsize](row, rhs.load[opsize](__idx(n)) )
                         result.store_stride[opsize](cur_offset, stride, product)
                     vectorize[nelts, rowmul_1X](lhs_last_shape)
-                    
-                    # Move to the next element in the last dimension
-                    indices[last_dim_index] += 1
-
-                    #For all dimensions
-                    for i in range(len(self.shape)-2, -1, -1):
-                        #if not the first dim and reached end, reset current and add one to previous
-                        if indices[i] == self.shape[i] and i!=0: 
-                            indices[i]=0
-                            indices[i-1]+=1
+                
+                #run this for all rows in tensor    
+                self.op_over_dimension(self.rank - 2, vec_mul)                    
+                
                 return result
-        #hadamard product with a matrix
+        #tensor ☉ matrix
         elif rhs.rank == 2:
-            #TODO: check last two dimensions match
-            #TODO: rhs offset and stride can be much simpler, since rhs is 2d, these are known
             var result = Tensor[type](self.shape)
             
-            #init running index to 0,...,0 for shape
-            var indices = self.shape.deepcopy()
-            for i in range(len(indices)): indices[i] = 0
-            
-            var last_dim_index = self.rank - 2
-
-            while True: 
-                #reached the end of the first dimension, done looping through all dims
-                if (self.shape[0]-1 <  indices[0]):
-                    break    
-
-                #get the stride
+            @parameter
+            fn tensor_mul(indices: DynamicVector[Int]):
+                #get the strides (lhs stride may be bigger as lhs may be > R2)
                 let stride = __get_dim_product(self.shape, self.rank-1)
                 let rhs_stride = rhs.shape[0] #only need __get_dim_product(rhs.shape, rhs.rank-1) for rank > 2
 
@@ -372,7 +332,7 @@ struct Tensor[type: DType]:
                 let lhs_offset = self.index_to_offset(indices)
                 let rhs_offset = indices[len(indices)-2] #only need rhs.index_to_offset(indices[len(indices)-2]) for rank>2
                       
-                #load lhs row, load rhs row, mul
+                #load lhs row, load rhs row, mul, and store in result
                 @parameter
                 fn rowmul_X2[opsize: Int](n : Int): 
                     let cur_lhs_offset = lhs_offset+(n*stride)
@@ -380,50 +340,17 @@ struct Tensor[type: DType]:
                     let rhs_row = rhs.load_stride[opsize](rhs_offset+(n*rhs_stride), rhs_stride)
                     let product = mul[type, opsize](lhs_row, rhs_row)
                     result.store_stride[opsize](cur_lhs_offset, stride, product)
-                vectorize[nelts, rowmul_X2](lhs_last_shape)
+                vectorize[nelts, rowmul_X2](lhs_last_shape)            
                 
-                # Move to the next element in the last dimension
-                indices[last_dim_index] += 1
+            #run this for all matrices(last two dims) in the tensor
+            self.op_over_dimension(self.rank - 2, tensor_mul)
 
-                #For all dimensions
-                for i in range(len(self.shape)-2, -1, -1):
-                    #if not the first dim and reached end, reset current and add one to previous
-                    if indices[i] == self.shape[i] and i!=0: 
-                        indices[i]=0
-                        indices[i-1]+=1
-            return result       
+            return result
          
 
         #temp catch all
         return Tensor[type].zeros(1)   
-    
-    #generic function to loop over dimensions of a tensor, upto specified dim
-    #and execute an operation at specified dim (like scalar, row, colum, etc)
-    fn op_over_dimension(inout self, last_dim_index: Int, op: fn() capturing-> None ):            
-            #init running index to 0,...,0 for shape
-            var indices = self.shape.deepcopy()
-            for i in range(len(indices)): indices[i] = 0            
-
-            while True: 
-                #reached the end of the first dimension, done looping through all dims
-                if (self.shape[0]-1 <  indices[0]):
-                    break    
-
-                #execute op
-                op()
-                            
-                
-                # Move to the next element in the last dimension
-                indices[last_dim_index] += 1
-
-                #For all dimensions
-                for i in range(len(self.shape)-2, -1, -1):
-                    #if not the first dim and reached end, reset current and add one to previous
-                    if indices[i] == self.shape[i] and i!=0: 
-                        indices[i]=0
-                        indices[i-1]+=1
-            return result       
-        
+            
     #layout is N, C, H, W
     #TODO:
     # - [done] recreate numpy dot for vec.vec, matrix.vec, matrix.matrx
@@ -476,6 +403,18 @@ struct Tensor[type: DType]:
         
         return Tensor[type].zeros(1)    
     
+    fn __imul__(inout self: Self, rhs: SIMD[type,1]):
+        alias nelts: Int = simdwidthof[type]()
+        @parameter
+        fn op[opsize: Int](n : Int):
+            self.store[opsize](__idx(n), self.load[opsize](__idx(n)) * rhs)
+        vectorize[nelts, op](self.size)
+        
+    fn __mul__(self: Self, rhs: SIMD[type,1]) -> Self:
+        var x = self
+        x*=rhs
+        return x
+    
     fn __iadd__(inout self: Self, rhs: SIMD[type,1]):
         alias nelts: Int = simdwidthof[type]()
         @parameter
@@ -487,46 +426,7 @@ struct Tensor[type: DType]:
         var x = self
         x+=rhs
         return x
-
-    
-    #Broadcast add. Supports:
-    # - row add (if trailing dimension matches)
-    # - col add (if first dimension matches and last dimension is 1)
-    # - matrix add, if shapes are ==
-    #TODO:
-    # - implement full broadcasting semantics, like in https://pytorch.org/docs/stable/notes/broadcasting.html#broadcasting-semantics
-    fn __iadd__(inout self: Self, rhs: Self):
-        alias nelts: Int = simdwidthof[type]()
         
-        #tensor/tensor add
-        # - treat as flat buffers add all
-        if __vector_compare(self.shape, rhs.shape):
-            @parameter
-            fn add_XX[opsize: Int](n : Int):
-                self.store[opsize](__idx(n), self.load[opsize](__idx(n)) + rhs.load[opsize](__idx(n)))
-            vectorize[nelts, add_XX](self.size)
-            return
-
-        #if row add
-        # - for every row (loop until the last dim)
-        # - strided vec add
-        #let row_dim = len(self.shape)-1
-        #if self.shape[row_dim] == rhs.shape[0] and rhw.rank==1:
-            
-        
-        #if col add
-        # - for every col (loop until you get to the second to last dim (col)),         
-        # - vectorize add 
-        
-        
-        
-    
-    fn __add__(self: Self, rhs: Self) -> Self:
-        var x = self
-        x+=rhs
-        return x
-    
-
     fn __isub__(inout self: Self, rhs: SIMD[type,1]):
         alias nelts: Int = simdwidthof[type]()
         @parameter
@@ -551,6 +451,86 @@ struct Tensor[type: DType]:
         x/=rhs
         return x    
     
-    ### Reduce ops
     
-    ### NN Ops
+    fn __iadd__(inout self: Self, rhs: Self):
+        pass
+    
+    fn __add__(self: Self, rhs: Self) -> Self:
+        alias nelts: Int = simdwidthof[type]()
+        var result = Tensor[type](self.shape)        
+        #tensor+tensor or vec+vec with same shape - treat as flat buffers, add all
+        if __vector_compare(self.shape, rhs.shape):
+            @parameter
+            fn same_add[opsize: Int](n : Int):
+                let product = add( self.load[opsize](__idx(n)) , rhs.load[opsize](__idx(n)))
+                result.store[opsize](__idx(n), product)
+            vectorize[nelts, same_add](self.size)
+            return result            
+
+        #tensor + vec row add
+        if rhs.rank==1 and rhs.shape[0] == self.shape[len(self.shape)-2]:
+            print("in rowadd")
+            fn rowvec_add(indices: DynamicVector[Int]):
+                #get the stride and offset for this row
+                let stride = __get_dim_product(self.shape, self.rank-1)
+                let offset = self.index_to_offset(indices)
+
+                #vectorize a strided load (row), multiply w/ rhs(vector), and do strided_store
+                @parameter
+                fn rowadd[opsize: Int](n : Int):
+                    let cur_offset = offset+(n*stride)                        
+                    let row = self.load_stride[opsize](cur_offset, stride)
+                    let product = add[type, opsize](row, rhs.load[opsize](__idx(n)) )
+                    result.store_stride[opsize](cur_offset, stride, product)
+                vectorize[nelts, rowadd](rhs.shape[0])
+
+            #run this for all rows in tensor    
+            self.op_over_dimension(self.rank - 2, rowvec_add)                    
+            return result
+    
+        #tensor + vec(X,1) col add (add col to the second to last dim of tensor
+        if rhs.rank==2 and rhs.shape[1]==1 and rhs.shape[0] == self.shape[len(self.shape)-2]:
+            fn colvec_add(indices: DynamicVector[Int]):
+                #vectorize a strided load (row), multiply w/ rhs(vector), and do strided_store
+                @parameter
+                fn coladd[opsize: Int](n : Int):
+                    var cur_idx = indices.deepcopy()
+                    cur_idx[len(indices)-1]=n
+                    result.store[opsize](cur_idx, self.load[opsize](cur_idx) + rhs.load[opsize](__idx(n)))
+                vectorize[nelts, coladd](rhs.shape[0])
+
+            #run this for all rows in tensor    
+            self.op_over_dimension(self.rank - 2, colvec_add)                    
+            return result
+        
+        #change to failure
+        return Tensor[type].zeros(1)
+    
+    ### Reduce ops
+        
+    #generic function to loop over dimensions of a tensor
+    #and execute an operation over last_dim dimension (like scalar, row, colum, etc)
+    fn op_over_dimension(self, last_dim_index: Int, op: fn(DynamicVector[Int]) capturing-> None ):            
+            #init running index to 0,...,0 for shape
+            var indices = self.shape.deepcopy()
+            for i in range(len(indices)): indices[i] = 0            
+
+            while True: 
+                #reached the end of the first dimension, done looping through all dims
+                if (self.shape[0]-1 <  indices[0]):
+                    break    
+
+                #execute op
+                op(indices)
+                            
+                
+                # Move to the next element in the last dimension
+                indices[last_dim_index] += 1
+
+                #For all dimensions
+                for i in range(len(self.shape)-2, -1, -1):
+                    #if not the first dim and reached end, reset current and add one to previous
+                    if indices[i] == self.shape[i] and i!=0: 
+                        indices[i]=0
+                        indices[i-1]+=1
+    
