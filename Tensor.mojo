@@ -1,6 +1,6 @@
 #cant do import, need to do from import
 from Vector import DynamicVector
-from Math import sqrt, exp, max, mul, add, sub
+from Math import sqrt, exp, max, mul, add, sub, div
 from String import String
 from List import VariadicList
 from Buffer import Buffer, NDBuffer
@@ -10,7 +10,7 @@ from Random import rand, randint
 from Memory import memset_zero, memcpy
 from Reductions import variance, mean
 from TargetInfo import simdwidthof
-from IO import print_no_newline
+from IO import print, print_no_newline
 from Assert import debug_assert
 from Functional import vectorize
 from Intrinsics import strided_load
@@ -271,86 +271,7 @@ struct Tensor[type: DType]:
         print(out)        
     
     ### Operators (add, sub, mul, exp, pow)                    
-    
-    #layout is N, C, H, W
-    # Computes Self ☉ rhs (https://en.wikipedia.org/wiki/Hadamard_product_(matrices))
-    #TODO
-    # - Important: shape cheks to raise errors
-    # - Add func name to error messages
-    # - [done] matrix . matrix mul (rhs.rank==2)
-    # - later: implement for column vectors (2,1) or (1,1,1,X) shapes 
-    fn __mul__(self: Self, rhs: Self) -> Self:
-        alias nelts: Int = simdwidthof[type]()
-        let lhs_last_shape = self.shape[len(self.shape)-1]
-        let rhs_last_shape = rhs.shape[len(rhs.shape)-1]        
                 
-        #self ☉ vec
-        if rhs.rank == 1:
-            if not(lhs_last_shape == rhs_last_shape): print("Shapes not aligned:", lhs_last_shape, rhs_last_shape)
-            #vec * vec
-            if self.rank == 1: 
-                var result = Tensor[type].zeros(self.shape[0])
-                @parameter
-                fn rowmul_11[opsize: Int](n : Int):
-                    let product = self.load[opsize](__idx(n)) * rhs.load[opsize](__idx(n))
-                    result.store[opsize](__idx(n), product)
-                vectorize[nelts, rowmul_11](self.size)
-                return result
-            #tensor(>= 2R) ☉ vec
-            else:
-                var result = Tensor[type](self.shape)
-                                
-                fn vec_mul(indices: DynamicVector[Int]):
-                    #get the stride and offset for this row
-                    let stride = __get_dim_product(self.shape, self.rank-1)
-                    let offset = self.index_to_offset(indices)
-                    
-                    #vectorize a strided load (row), multiply w/ rhs(vector), and do strided_store
-                    @parameter
-                    fn rowmul_1X[opsize: Int](n : Int):
-                        let cur_offset = offset+(n*stride)                        
-                        let row = self.load_stride[opsize](cur_offset, stride)
-                        let product = mul[type, opsize](row, rhs.load[opsize](__idx(n)) )
-                        result.store_stride[opsize](cur_offset, stride, product)
-                    vectorize[nelts, rowmul_1X](lhs_last_shape)
-                
-                #run this for all rows in tensor    
-                self.op_over_dimension(self.rank - 2, vec_mul)                    
-                
-                return result
-        #tensor ☉ matrix
-        elif rhs.rank == 2:
-            var result = Tensor[type](self.shape)
-            
-            @parameter
-            fn tensor_mul(indices: DynamicVector[Int]):
-                #get the strides (lhs stride may be bigger as lhs may be > R2)
-                let stride = __get_dim_product(self.shape, self.rank-1)
-                let rhs_stride = rhs.shape[0] #only need __get_dim_product(rhs.shape, rhs.rank-1) for rank > 2
-
-                #get the offset - the location of the start of lhs and rhs rows
-                let lhs_offset = self.index_to_offset(indices)
-                let rhs_offset = indices[len(indices)-2] #only need rhs.index_to_offset(indices[len(indices)-2]) for rank>2
-                      
-                #load lhs row, load rhs row, mul, and store in result
-                @parameter
-                fn rowmul_X2[opsize: Int](n : Int): 
-                    let cur_lhs_offset = lhs_offset+(n*stride)
-                    let lhs_row = self.load_stride[opsize](cur_lhs_offset, stride)
-                    let rhs_row = rhs.load_stride[opsize](rhs_offset+(n*rhs_stride), rhs_stride)
-                    let product = mul[type, opsize](lhs_row, rhs_row)
-                    result.store_stride[opsize](cur_lhs_offset, stride, product)
-                vectorize[nelts, rowmul_X2](lhs_last_shape)            
-                
-            #run this for all matrices(last two dims) in the tensor
-            self.op_over_dimension(self.rank - 2, tensor_mul)
-
-            return result
-         
-
-        #temp catch all
-        return Tensor[type].zeros(1)   
-            
     #layout is N, C, H, W
     #TODO:
     # - [done] recreate numpy dot for vec.vec, matrix.vec, matrix.matrx
@@ -455,82 +376,176 @@ struct Tensor[type: DType]:
     fn __iadd__(inout self: Self, rhs: Self):
         pass
     
-    fn __add__(self: Self, rhs: Self) -> Self:
+    
+    #This is very messy, find something cleaner
+    # - Struggling to find a way to pass Math lib function as ags (since the op is executed within vectorize)
+    # - Opting for an if :( based on parameter (which should be an Enum
+    fn broadcast_op[op: Int](self: Self, rhs: Self) -> Self:
         alias nelts: Int = simdwidthof[type]()
-        var result = Tensor[type](self.shape)        
+        var result = Tensor[type](self.shape)
+        
+        let lhs_last_shape = self.shape[len(self.shape)-1]
+        let rhs_last_shape = rhs.shape[len(rhs.shape)-1]
+        
         #tensor+tensor or vec+vec with same shape - treat as flat buffers, add all
         if __vector_compare(self.shape, rhs.shape):
             @parameter
-            fn same_add[opsize: Int](n : Int):
-                let product = add( self.load[opsize](__idx(n)) , rhs.load[opsize](__idx(n)))
-                result.store[opsize](__idx(n), product)
-            vectorize[nelts, same_add](self.size)
+            fn same_op[opsize: Int](n : Int):
+                if op == 0:
+                    result.store[opsize](__idx(n), add( self.load[opsize](__idx(n)) , rhs.load[opsize](__idx(n))) )
+                elif op ==1:
+                    result.store[opsize](__idx(n), sub( self.load[opsize](__idx(n)) , rhs.load[opsize](__idx(n))) )
+                elif op ==2:
+                    result.store[opsize](__idx(n), div( self.load[opsize](__idx(n)) , rhs.load[opsize](__idx(n))) )
+                elif op ==3:
+                    result.store[opsize](__idx(n), mul( self.load[opsize](__idx(n)) , rhs.load[opsize](__idx(n))) )                    
+                else:
+                    print("Operation not supported")
+            vectorize[nelts, same_op](self.size)
             return result            
 
-        #tensor + vec row add
-        if rhs.rank==1 and rhs.shape[0] == self.shape[len(self.shape)-2]:
-            print("in rowadd")
-            fn rowvec_add(indices: DynamicVector[Int]):
+        #tensor + row vec 
+        if rhs.rank==1 and rhs.shape[0] == lhs_last_shape:
+            fn rowvec_op(indices: DynamicVector[Int]):
                 #get the stride and offset for this row
                 let stride = __get_dim_product(self.shape, self.rank-1)
                 let offset = self.index_to_offset(indices)
 
                 #vectorize a strided load (row), multiply w/ rhs(vector), and do strided_store
                 @parameter
-                fn rowadd[opsize: Int](n : Int):
+                fn rowop[opsize: Int](n : Int):
                     let cur_offset = offset+(n*stride)                        
                     let row = self.load_stride[opsize](cur_offset, stride)
-                    let product = add[type, opsize](row, rhs.load[opsize](__idx(n)) )
-                    result.store_stride[opsize](cur_offset, stride, product)
-                vectorize[nelts, rowadd](rhs.shape[0])
+                    
+                    if op == 0:
+                        result.store_stride[opsize](cur_offset, stride, add(row, rhs.load[opsize](__idx(n))) )
+                    elif op ==1:
+                        result.store_stride[opsize](cur_offset, stride, sub(row, rhs.load[opsize](__idx(n))) )
+                    elif op ==2:
+                        result.store_stride[opsize](cur_offset, stride, div(row, rhs.load[opsize](__idx(n))) )
+                    elif op ==3:
+                        result.store_stride[opsize](cur_offset, stride, mul(row, rhs.load[opsize](__idx(n))) )                        
+                    else:
+                        print("Operation not supported")
+                           
+                vectorize[nelts, rowop](rhs.shape[0])
 
             #run this for all rows in tensor    
-            self.op_over_dimension(self.rank - 2, rowvec_add)                    
+            self.op_over_dimension(self.rank - 2, rowvec_op)                    
             return result
-    
-        #tensor + vec(X,1) col add (add col to the second to last dim of tensor
-        if rhs.rank==2 and rhs.shape[1]==1 and rhs.shape[0] == self.shape[len(self.shape)-2]:
-            fn colvec_add(indices: DynamicVector[Int]):
-                #vectorize a strided load (row), multiply w/ rhs(vector), and do strided_store
+        
+        #tensor + column vec(X,1)
+        if rhs.rank==2 and rhs.shape[1]==1 and rhs.shape[0] == self.shape[self.rank-2]:
+            fn colvec_op(indices: DynamicVector[Int]):
+                #get the stride and offset for this row
+                let stride = __get_dim_product(self.shape, self.rank-1)
+                let offset = self.index_to_offset(indices)
+
+                #vectorize a strided load (row), apply op w/ rhs[i], and do strided_store
                 @parameter
-                fn coladd[opsize: Int](n : Int):
-                    var cur_idx = indices.deepcopy()
-                    cur_idx[len(indices)-1]=n
-                    result.store[opsize](cur_idx, self.load[opsize](cur_idx) + rhs.load[opsize](__idx(n)))
-                vectorize[nelts, coladd](rhs.shape[0])
+                fn colop[opsize: Int](n : Int):
+                    let cur_offset = offset+(n*stride)                        
+                    let row = self.load_stride[opsize](cur_offset, stride)
+
+                    let val = SIMD[type, opsize](rhs.load[1](__idx(indices[self.rank-2], 0)))
+                    if op == 0:
+                        result.store_stride[opsize](cur_offset, stride, add(row, val) )
+                    elif op ==1:
+                        result.store_stride[opsize](cur_offset, stride, sub(row, val) )
+                    elif op ==2:
+                        result.store_stride[opsize](cur_offset, stride, div(row, val) )
+                    elif op ==3:
+                        result.store_stride[opsize](cur_offset, stride, mul(row, val) )                        
+                    else:
+                        print("Operation not supported")
+                           
+                vectorize[nelts, colop](self.shape[self.rank-1])
 
             #run this for all rows in tensor    
-            self.op_over_dimension(self.rank - 2, colvec_add)                    
+            self.op_over_dimension(self.rank - 2, colvec_op)                    
+            return result
+        
+        #tensor+matrix
+        if rhs.rank == 2:
+            var result = Tensor[type](self.shape)
+            @parameter
+            fn tensor_op(indices: DynamicVector[Int]):
+                #get the strides (lhs stride may be bigger as lhs may be > R2)
+                let stride = __get_dim_product(self.shape, self.rank-1)
+                let rhs_stride = rhs.shape[0] #only need __get_dim_product(rhs.shape, rhs.rank-1) for rank > 2
+
+                #get the offset - the location of the start of lhs and rhs rows
+                let lhs_offset = self.index_to_offset(indices)
+                let rhs_offset = indices[len(indices)-2] #only need rhs.index_to_offset(indices[len(indices)-2]) for rank>2
+                      
+                #load lhs row, load rhs row, mul, and store in result
+                @parameter
+                fn rowop_X2[opsize: Int](n : Int): 
+                    let cur_lhs_offset = lhs_offset+(n*stride)
+                    let lhs_row = self.load_stride[opsize](cur_lhs_offset, stride)
+                    let rhs_row = rhs.load_stride[opsize](rhs_offset+(n*rhs_stride), rhs_stride)
+
+                    if op == 0:
+                        let product = add[type, opsize](lhs_row, rhs_row)
+                        result.store_stride[opsize](cur_lhs_offset, stride, product)                                                        
+                    elif op ==1:
+                        let product = sub[type, opsize](lhs_row, rhs_row)                        
+                        result.store_stride[opsize](cur_lhs_offset, stride, product)
+                    elif op ==2:
+                        let product = div[type, opsize](lhs_row, rhs_row)                        
+                        result.store_stride[opsize](cur_lhs_offset, stride, product)
+                    elif op ==3:
+                        let product = mul[type, opsize](lhs_row, rhs_row)                        
+                        result.store_stride[opsize](cur_lhs_offset, stride, product)                        
+                    else:
+                        print("Operation not supported")
+                    
+                vectorize[nelts, rowop_X2](lhs_last_shape)            
+                
+            #run this for all matrices(last two dims) in the tensor
+            self.op_over_dimension(self.rank - 2, tensor_op)
             return result
         
         #change to failure
-        return Tensor[type].zeros(1)
+        return Tensor[type].zeros(1)      
+    
+    fn __add__(self: Self, rhs: Self) -> Self:
+        return self.broadcast_op[0](rhs)
+
+    #layout is N, C, H, W
+    # Computes Self ☉ rhs (https://en.wikipedia.org/wiki/Hadamard_product_(matrices))
+    #TODO
+    # - Important: shape cheks to raise errors
+    # - Add func name to error messages
+    # - [done] matrix . matrix mul (rhs.rank==2)
+    # - later: implement for column vectors (2,1) or (1,1,1,X) shapes 
+    fn __mul__(self: Self, rhs: Self) -> Self:
+        return self.broadcast_op[3](rhs)
     
     ### Reduce ops
         
     #generic function to loop over dimensions of a tensor
     #and execute an operation over last_dim dimension (like scalar, row, colum, etc)
-    fn op_over_dimension(self, last_dim_index: Int, op: fn(DynamicVector[Int]) capturing-> None ):            
+    fn op_over_dimension(self, last_dim_index: Int, op: fn(DynamicVector[Int]) capturing-> None, ignore_dim_index:Int = -1 ):            
             #init running index to 0,...,0 for shape
             var indices = self.shape.deepcopy()
             for i in range(len(indices)): indices[i] = 0            
-
-            while True: 
+                                        
+            while True:
                 #reached the end of the first dimension, done looping through all dims
                 if (self.shape[0]-1 <  indices[0]):
                     break    
 
                 #execute op
                 op(indices)
-                            
                 
                 # Move to the next element in the last dimension
                 indices[last_dim_index] += 1
+                
 
-                #For all dimensions
-                for i in range(len(self.shape)-2, -1, -1):
+                #For all dimensions, except the last one
+                for i in range(last_dim_index, -1, -1):
                     #if not the first dim and reached end, reset current and add one to previous
-                    if indices[i] == self.shape[i] and i!=0: 
+                    if indices[i] == self.shape[i] and i!=0:
                         indices[i]=0
                         indices[i-1]+=1
-    
