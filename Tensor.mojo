@@ -250,7 +250,7 @@ struct Tensor[type: DType]:
                 out = out + "\n"  # Move to the next line after printing the last element of a dimension
     
     
-    fn show(self, summary: Bool = False):
+    fn show(self, summary: Bool = False, data: Bool=True):
         #print summary
         if summary:
             #shape            
@@ -261,69 +261,18 @@ struct Tensor[type: DType]:
             print("Size: ", self.size)
 
         #print data - call recursive print
-        print("Data:")
-        var indices = DynamicVector[Int]()
-        for i in range(len(self.shape)):
-            indices.push_back(0)
+        if data:
+            print("Data:")
+            var indices = DynamicVector[Int]()
+            for i in range(len(self.shape)):
+                indices.push_back(0)
             
-        var out = String("")
-        self.print_tensor_recursive(0, indices, out) 
-        print(out)        
+            var out = String("")
+            self.print_tensor_recursive(0, indices, out) 
+            print(out)        
     
     ### Operators (add, sub, mul, exp, pow)                    
                 
-    #layout is N, C, H, W
-    #TODO:
-    # - [done] recreate numpy dot for vec.vec, matrix.vec, matrix.matrx
-    # - implement tensor(>R2) . matrix or vec (extra dimension is the batch)
-    fn dot(self: Self, rhs: Self) -> Self:
-        alias nelts: Int = simdwidthof[type]()
-        #vec . vec [1]
-        if rhs.rank == 1 and self.rank == 1: #what about colum vectors (with a higher rank but empty rows(1,...,X)?
-            var result = Tensor[type].zeros(1)
-            @parameter
-            fn dot_11[opsize: Int](n : Int):
-                let product = self.load[opsize](__idx(n)) * rhs.load[opsize](__idx(n))
-                result[__idx(0)]+= product.reduce_add()
-            vectorize[nelts, dot_11](self.size)
-            return result 
-        #matrix.matrix [MxN]
-        elif self.rank == 2 and rhs.rank == 2:         
-            if not(self.shape[1] == rhs.shape[1]): print("In dot shapes not aligned:", self.shape[1], rhs.shape[0])
-            var result = Tensor[type].zeros(self.shape[0], rhs.shape[1])  
-            for m in range(result.shape[0]):                    
-                for k in range(self.shape[1]):
-                    @parameter
-                    fn dot_22[nelts : Int](n : Int):
-                        result.store[nelts](__idx(m,n), result.load[nelts]( __idx(m,n) ) + self[ __idx(m,k) ] * rhs.load[nelts]( __idx(k,n) ))
-                    vectorize[nelts, dot_22](result.shape[1])
-            return result            
-        #matrix . vec [result is 1xM]
-        elif self.rank == 2 and rhs.rank == 1:             
-            if not(self.shape[1] == rhs.shape[0]): print("In dot, shapes not aligned:", self.shape[1], rhs.shape[0])
-            var result = Tensor[type].zeros(self.shape[0])  
-            #for each row of self (or col of result), do a vec.vec - do: (strided load of row) * rhs, store in n
-            for m in range(result.shape[0]):
-                let stride = __get_dim_product(self.shape, self.rank-1)
-                let offset = self.index_to_offset(__idx(m))                
-                @parameter
-                fn rowdot[opsize: Int](n : Int):
-                    let cur_offset = offset+(n*stride)
-                    let row = self.data.offset(cur_offset).simd_strided_load[opsize](stride)
-                    let product = mul[type, opsize](row, rhs.load[opsize](__idx(n)) )
-                    result[__idx(m)] += product.reduce_add()
-                vectorize[nelts, rowdot](rhs.shape[0])
-            return result
-        #tensor . vec
-        elif self.rank == 3 and rhs.rank == 1:
-            #for each matrix in first dim, do matrix.vec
-            pass
-        #tensor . matrix
-        elif self.rank == 3 and rhs.rank == 2:            
-            pass
-        
-        return Tensor[type].zeros(1)    
-    
     fn __imul__(inout self: Self, rhs: SIMD[type,1]):
         alias nelts: Int = simdwidthof[type]()
         @parameter
@@ -372,14 +321,13 @@ struct Tensor[type: DType]:
         x/=rhs
         return x    
     
-    
-    fn __iadd__(inout self: Self, rhs: Self):
-        pass
-    
-    
-    #This is very messy, find something cleaner
-    # - Struggling to find a way to pass Math lib function as ags (since the op is executed within vectorize)
-    # - Opting for an if :( based on parameter (which should be an Enum
+    # Generic brodacast op method. Layout is N, C, H, W. Supports following:    
+    # - ops: mul, add, sub, div, 
+    # - shapes: vec*vec, matrix*matrix,tensor/matrix*rowvec, tensor/matrix*colvec, 
+    # TODO:
+    # - Very messy. Didn't find a way to pass op as param, had to go for messy ifs and a fake enum. Clean.
+    # - Important: change shape cheks to raise errors
+    # - Add op name to error messages
     fn broadcast_op[op: Int](self: Self, rhs: Self) -> Self:
         alias nelts: Int = simdwidthof[type]()
         var result = Tensor[type](self.shape)
@@ -507,23 +455,25 @@ struct Tensor[type: DType]:
             return result
         
         #change to failure
+        print("Shapes not supported for broadcast op. ", __vector_to_string(self.shape), __vector_to_string(rhs.shape))
         return Tensor[type].zeros(1)      
     
     fn __add__(self: Self, rhs: Self) -> Self:
         return self.broadcast_op[0](rhs)
 
-    #layout is N, C, H, W
     # Computes Self ☉ rhs (https://en.wikipedia.org/wiki/Hadamard_product_(matrices))
-    #TODO
-    # - Important: shape cheks to raise errors
-    # - Add func name to error messages
-    # - [done] matrix . matrix mul (rhs.rank==2)
-    # - later: implement for column vectors (2,1) or (1,1,1,X) shapes 
     fn __mul__(self: Self, rhs: Self) -> Self:
         return self.broadcast_op[3](rhs)
+
+    fn __sub__(self: Self, rhs: Self) -> Self:
+        return self.broadcast_op[0](rhs)
+
+    # Computes Self ☉ rhs (https://en.wikipedia.org/wiki/Hadamard_product_(matrices))
+    fn __truediv__(self: Self, rhs: Self) -> Self:
+        return self.broadcast_op[3](rhs)
     
-    ### Reduce ops
-        
+    
+    ### Reduce ops        
     #generic function to loop over dimensions of a tensor
     #and execute an operation over last_dim dimension (like scalar, row, colum, etc)
     fn op_over_dimension(self, last_dim_index: Int, op: fn(DynamicVector[Int]) capturing-> None, ignore_dim_index:Int = -1 ):            
@@ -549,3 +499,57 @@ struct Tensor[type: DType]:
                     if indices[i] == self.shape[i] and i!=0:
                         indices[i]=0
                         indices[i-1]+=1
+    ### NN Ops
+    
+    
+    #TODO:
+    # - [done] recreate numpy dot for vec.vec, matrix.vec, matrix.matrx
+    # - implement tensor(>R2) . matrix or vec (extra dimension is the batch)
+    fn dot(self: Self, rhs: Self) -> Self:
+        alias nelts: Int = simdwidthof[type]()
+        #vec . vec [1]
+        if rhs.rank == 1 and self.rank == 1: #what about colum vectors (with a higher rank but empty rows(1,...,X)?
+            var result = Tensor[type].zeros(1)
+            @parameter
+            fn dot_11[opsize: Int](n : Int):
+                let product = self.load[opsize](__idx(n)) * rhs.load[opsize](__idx(n))
+                result[__idx(0)]+= product.reduce_add()
+            vectorize[nelts, dot_11](self.size)
+            return result 
+        #matrix.matrix [MxN]
+        elif self.rank == 2 and rhs.rank == 2:         
+            if not(self.shape[1] == rhs.shape[0]): print("In dot MM shapes not aligned:", __vector_to_string(self.shape), __vector_to_string(rhs.shape))
+            var result = Tensor[type].zeros(self.shape[0], rhs.shape[1])  
+            for m in range(result.shape[0]):                    
+                for k in range(self.shape[1]):
+                    @parameter
+                    fn dot_22[nelts : Int](n : Int):
+                        result.store[nelts](__idx(m,n), result.load[nelts]( __idx(m,n) ) + self[ __idx(m,k) ] * rhs.load[nelts]( __idx(k,n) ))
+                    vectorize[nelts, dot_22](result.shape[1])
+            return result            
+        #matrix . vec [result is 1xM]
+        elif self.rank == 2 and rhs.rank == 1:             
+            if not(self.shape[1] == rhs.shape[0]): print("In dot, 1M shapes not aligned:", __vector_to_string(self.shape), __vector_to_string(rhs.shape[0]))
+            var result = Tensor[type].zeros(self.shape[0])  
+            #for each row of self (or col of result), do a vec.vec - do: (strided load of row) * rhs, store in n
+            for m in range(result.shape[0]):
+                let stride = __get_dim_product(self.shape, self.rank-1)
+                let offset = self.index_to_offset(__idx(m))                
+                @parameter
+                fn rowdot[opsize: Int](n : Int):
+                    let cur_offset = offset+(n*stride)
+                    let row = self.data.offset(cur_offset).simd_strided_load[opsize](stride)
+                    let product = mul[type, opsize](row, rhs.load[opsize](__idx(n)) )
+                    result[__idx(m)] += product.reduce_add()
+                vectorize[nelts, rowdot](rhs.shape[0])
+            return result
+        #tensor . vec
+        elif self.rank == 3 and rhs.rank == 1:
+            #for each matrix in first dim, do matrix.vec
+            pass
+        #tensor . matrix
+        elif self.rank == 3 and rhs.rank == 2:            
+            pass
+        print("failed. dot")
+        return Tensor[type].zeros(1)    
+                            
