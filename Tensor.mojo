@@ -14,7 +14,6 @@ from IO import print, print_no_newline
 from Assert import debug_assert
 from Functional import vectorize
 from Intrinsics import strided_load
-from TypeUtilities import rebind
 
 
 #Helper functions. These functions smell, it would be good to remove these
@@ -70,6 +69,7 @@ fn __vector_to_string(vec: DynamicVector[Int]) -> String:
 # - use let for rank and size in struct, once supported
 # - implement basic ops with scalars other than SIMD[type,1] (like int)
 # - add a from_numpy static method
+# - add docstrings
 struct Tensor[type: DType]:
     #hacking around the gaps in DimList right now(e.g. no len)
     var rank: Int
@@ -126,6 +126,7 @@ struct Tensor[type: DType]:
     
     #Can this whole function be done with memset?
     fn fill(inout self, val: Int):
+        """ Fill this instance of tensor with val. Note, this fn doesn't cast."""
         alias nelts: Int = simdwidthof[type]()
         
         @parameter
@@ -135,6 +136,7 @@ struct Tensor[type: DType]:
     
     @staticmethod
     fn ones(*dims: Int) -> Self:
+        """Static fn to create a new Tensor filled with ones of shape _dims_."""
         let shape = __idx(dims)
         var x = Tensor[type](shape)
         x.fill(1) #this triggers a moveinit
@@ -142,17 +144,21 @@ struct Tensor[type: DType]:
             
     @staticmethod
     fn zeros(*dims: Int) -> Self:
+        """An alias to Tensor(*dims), creates a new tensor filled with 0 of shape _dims_."""
         let shape = __idx(dims)
         return Self(shape) #by default the values are set to 0
     
     @staticmethod
     fn random_int(shape: DynamicVector[Int], int_low:Int =0, int_high:Int =10) -> Self:
+        """Static fn to create a new Tensor of shape _shape, filled with random ints. 
+           Note, this fn takes DynamicVector for shape (as opposed to *dims), bcs Mojo doesn't support unpacking yet"""
         let x = Tensor[type](shape)
         randint[type](x.data, x.size, int_low, int_high)
         return x        
         
     @staticmethod
     fn random(*dims: Int) -> Self:
+        """Static fn to create a new Tensor filled with random values of Tensor param type"""
         let shape = __idx(dims)
         let x = Tensor[type](shape)
         rand[type](x.data, x.size)        
@@ -163,6 +169,9 @@ struct Tensor[type: DType]:
     # - turn dims into *Int, once name arguments are supported
     @staticmethod
     fn arange(shape:DynamicVector[Int], start: Int =0, step: Int =1) -> Self:
+        """Static fn to create a new tendor filled with a list of increasing numbers, 
+           starting at _start_, increasing by _step_ size. Will continue until shape is full.
+           Note, this fn takes DynamicVector for shape (as opposed to *dims), bcs Mojo doesn't support unpacking yet"""
         var x = Tensor[type](shape)        
         var val = start
         for i in range(x.size):
@@ -193,11 +202,36 @@ struct Tensor[type: DType]:
 
     @always_inline 
     fn load_stride[nelts:Int](self, offset:Int, stride: Int) -> SIMD[type, nelts]:
+        """Utility fn to load data from memory with a stride from this Tensor, 
+        starting at _offset_ and with stride of _stride_
+        
+        If data at pointer _self.data_ was [0,1,2,3,4,5,...,N]
+        load_stride(0, 2) would return 0,2,4,...,N
+        """
         return self.data.offset(offset).simd_strided_load[nelts](stride)
     
     @always_inline
     fn load[nelts:Int](self, index: DynamicVector[Int]) -> SIMD[type, nelts]:
-        #the offset is calculated as prod(shape:[:-1])*loc[-1] + ... + loc[0]        
+        """Utility fn to load _nelts_ sized data from memory for this Tensor 
+        at the provided index.
+        
+        Parameters
+        ----------
+        nelts : int
+            Size of data to load. (This often should match the SIMD size of the type)
+
+        Arguments
+        ----------
+        index : DynamicVector[Int]
+            A list of Ints specifying where to start loading data from. Has the same layout as shape.
+            The index (in 1 or more dimensions) is used to comupte an offset into memory. 
+            The offset is calculated as the product of: data.shape[:-1]*index[-1] + ... + loc[0]        
+            
+        Returns
+        -------
+        SIMD[type, nelts]
+        """
+        #
         let offset = self.index_to_offset(index)
         return self.data.simd_load[nelts](offset)
     
@@ -207,15 +241,18 @@ struct Tensor[type: DType]:
 
     @always_inline
     fn store_stride[nelts:Int](self, offset:Int, stride:Int, val:SIMD[type,nelts]) :
+        """Utility fn to store data in a Tensor, with a stride. See load_stride"""
         self.data.offset(offset).simd_strided_store[nelts](val, stride)    
 
     @always_inline
     fn store[nelts:Int](self, index: DynamicVector[Int], val:SIMD[type,nelts]) :
+        """Utility fn to store data in a Tensor. See load."""
         let offset = self.index_to_offset(index) 
         self.data.simd_store[nelts](offset, val)                     
     
     #return an offset into data pointer, represented by the index
     fn index_to_offset(self, index: DynamicVector[Int]) -> Int:
+        """Given an index (DynamicVector[Int]) in R>=R1, calculate an offset in R1 (flat)"""        
         var offset = 0 
 
         #calculate products 
@@ -231,26 +268,28 @@ struct Tensor[type: DType]:
         return offset
 
     fn index_to_offset(self, *index: Int) -> Int:
+        """Overloaded index_to_offset that accepts a list of Int as the index"""
         let index_vector = __idx(VariadicList[Int](index))
         return self.index_to_offset(index_vector)
     
     ### Display Ops
-    ### Refactor to use op_over_dimension
-    fn print_tensor_recursive(self, dim: Int, inout indices: DynamicVector[Int], inout out: String):
-        #Tons of potential issues here: recursion, print one at a time, etc
+    ### TODO: Refactor to use op_over_dimension
+    fn __print_tensor_recursive(self, dim: Int, inout indices: DynamicVector[Int], inout out: String):
+        """Internal utility fn to print a tensor. Recursively iterates through each index and prints value"""
         if dim == len(self.shape):  # Base case: reached the innermost dimension
             out = out + " " + self[indices]
             return
 
         for i in range(self.shape[dim]):
             indices[dim] = i
-            self.print_tensor_recursive(dim + 1, indices, out)
+            self.__print_tensor_recursive(dim + 1, indices, out)
 
             if i == self.shape[dim] - 1:
                 out = out + "\n"  # Move to the next line after printing the last element of a dimension
     
     
     fn show(self, summary: Bool = False, data: Bool=True):
+        """Utility fn to print a Tensor. Can print summary, data or both"""
         #print summary
         if summary:
             #shape            
@@ -268,11 +307,11 @@ struct Tensor[type: DType]:
                 indices.push_back(0)
             
             var out = String("")
-            self.print_tensor_recursive(0, indices, out) 
+            self.__print_tensor_recursive(0, indices, out) 
             print(out)        
     
-    ### Operators (add, sub, mul, exp, pow)                    
-                
+    ### Operators (add, sub, mul, exp, pow)
+    #Note, ignore ips in autograd - iops (e.g. imul), are trickier for autograd                
     fn __imul__(inout self: Self, rhs: SIMD[type,1]):
         alias nelts: Int = simdwidthof[type]()
         @parameter
@@ -321,14 +360,48 @@ struct Tensor[type: DType]:
         x/=rhs
         return x    
     
-    # Generic brodacast op method. Layout is N, C, H, W. Supports following:    
-    # - ops: mul, add, sub, div, 
-    # - shapes: vec*vec, matrix*matrix,tensor/matrix*rowvec, tensor/matrix*colvec, 
+    # Generic brodacast op method.  Supports following:    
     # TODO:
-    # - Very messy. Didn't find a way to pass op as param, had to go for messy ifs and a fake enum. Clean.
+    # - Clean! Very messy. Didn't find a way to pass an op as param or argument. Went for messy ifs and a fake enum. 
     # - Important: change shape cheks to raise errors
     # - Add op name to error messages
     fn broadcast_op[op: Int](self: Self, rhs: Self) -> Self:
+        """Utility fn to execute an operation _op_ with broadcast semantics. For reference 
+        the layout (indexing regime) for data in a Tensor N, C, H, W.
+
+        Supports opertations for the following Tensor shape combinations:
+          - vec * vec or tensor * tensor where the shapes are equal: will do an element 
+          wise operation (self _op_ rhs) for each value in both tensors.
+          - tensor (>=R2) * row vector (R1): if row shapes match, will do an element wise
+          operation for each element in every row of self with each element in rhs (single row)
+          - tensor (>=R2) * col vector (R2; (rows, 1)): if column shapes match will do an element 
+          wise operation for each element in every column of self with each single element in each
+          row of rhs.
+          - tensor (R>=2) * matrix (R2): if matrix shapes match (rhw shape matches the last two 
+          dimensions of tensor), will do an element wise _op_ for each matrix in tensor with rhs (matrix)
+          
+        
+        Parameters
+        ----------
+        op : int
+            The 'enum' value of the operations to execute. 
+              0 = add
+              1 = sub
+              2 = div
+              3 = mul (element wise multiplication as opposed to dot product)
+
+        Arguments
+        ----------
+        self : Self 
+            The current Tensor, instantiated with parameter type. 
+            
+        rhs : Self 
+            The right hand side term of the operation. 
+            
+        Returns
+        -------
+        Self                
+        """
         alias nelts: Int = simdwidthof[type]()
         var result = Tensor[type](self.shape)
         
@@ -459,24 +532,49 @@ struct Tensor[type: DType]:
         return Tensor[type].zeros(1)      
     
     fn __add__(self: Self, rhs: Self) -> Self:
+        """Add two tensors together. See broadcast_op."""
         return self.broadcast_op[0](rhs)
 
-    # Computes Self ☉ rhs (https://en.wikipedia.org/wiki/Hadamard_product_(matrices))
+    # Computes 
     fn __mul__(self: Self, rhs: Self) -> Self:
+        """Computes the hadamard product (https://en.wikipedia.org/wiki/Hadamard_product_(matrices)) of two tensors"""
         return self.broadcast_op[3](rhs)
 
     fn __sub__(self: Self, rhs: Self) -> Self:
+        """Substract two tensors"""
         return self.broadcast_op[0](rhs)
 
-    # Computes Self ☉ rhs (https://en.wikipedia.org/wiki/Hadamard_product_(matrices))
     fn __truediv__(self: Self, rhs: Self) -> Self:
+        """Computes the division of two tensors."""
         return self.broadcast_op[3](rhs)
     
     
     ### Reduce ops        
-    #generic function to loop over dimensions of a tensor
-    #and execute an operation over last_dim dimension (like scalar, row, colum, etc)
+    
     fn op_over_dimension(self, last_dim_index: Int, op: fn(DynamicVector[Int]) capturing-> None, ignore_dim_index:Int = -1 ):            
+        """Utility fn to loop over this Tensor and execute an _op_ at a specified index.
+        
+        This method will loop over each element for every dimension in _self.shape_ up to last_dim_index.
+        For every index combination, it will execute a passed in _op_.
+        
+        For a Tensor with shape (2,2,2), op_over_dimension(1, my_op), will execute my_op 4 times:
+          my_op(0,0), my_op(0,1), my_op(1,0) and my_op(1,1).
+        
+        Arguments
+        ----------
+        last_dim_index: Int
+            The index of the last dimension to loop over. If _self.shape_ is (A,B,C) and 
+            last_dim_index=1, then op_over_dimension will only loop over A and B.
+        op: fn(DynamicVector[Int]) capturing-> None
+            The fn to execute. The fn must accept an index (DynamicVector[Int]) representing
+            the current index and return no value.
+            
+        Returns
+        -------
+        SIMD[type, nelts]
+        """
+   
+    
             #init running index to 0,...,0 for shape
             var indices = self.shape.deepcopy()
             for i in range(len(indices)): indices[i] = 0            
@@ -503,9 +601,11 @@ struct Tensor[type: DType]:
     
     
     #TODO:
-    # - [done] recreate numpy dot for vec.vec, matrix.vec, matrix.matrx
     # - implement tensor(>R2) . matrix or vec (extra dimension is the batch)
+    # - More detail in docstrings
     fn dot(self: Self, rhs: Self) -> Self:
+        """Compute the dot product between this tensor and a rhs tensor.
+           Currently supports vec.vec, matrix.matrix, matrix.vec"""
         alias nelts: Int = simdwidthof[type]()
         #vec . vec [1]
         if rhs.rank == 1 and self.rank == 1: #what about colum vectors (with a higher rank but empty rows(1,...,X)?
@@ -552,4 +652,16 @@ struct Tensor[type: DType]:
             pass
         print("failed. dot")
         return Tensor[type].zeros(1)    
-                            
+    
+    #implement Relu, Sigmoid, LeakyRelu, other activitations?
+    
+    #imlement backward
+    """
+    Backward should:
+    - called only on a Scalar tensor
+    - traverse the computation graph from here, building a list of nodes
+    - for every node - reversed in the computation graph, run backward (which will set grads)
+    - backward needs:
+    - - Every tensor needs to set it's backward if result of an OP
+    - - Grads applies to each Value in data, 
+    """
