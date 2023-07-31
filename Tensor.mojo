@@ -1,4 +1,4 @@
-#cant do import, need to do from import
+#TODO: make this it's own module once imports work, Tensor not subscritable
 from Vector import DynamicVector
 from Math import sqrt, exp, max, mul, add, sub, div
 from String import String
@@ -59,8 +59,6 @@ fn __vector_to_string(vec: DynamicVector[Int]) -> String:
         out+= ", "
     return out[0:len(out)-2]+"]"
 
-
-    
 #Tensor implementation backed by Pointer
 # - [done] make changes to remove need for Buffer within the struct
 # - [done] don't built long return strings for print, use print_no_line where needed
@@ -69,7 +67,9 @@ fn __vector_to_string(vec: DynamicVector[Int]) -> String:
 # - use let for rank and size in struct, once supported
 # - implement basic ops with scalars other than SIMD[type,1] (like int)
 # - add a from_numpy static method
-# - add docstrings
+# - [done-ish] add docstrings
+# - consider going back to DimList (in order to make this type 
+@value
 struct Tensor[type: DType]:
     #hacking around the gaps in DimList right now(e.g. no len)
     var rank: Int
@@ -77,7 +77,7 @@ struct Tensor[type: DType]:
     var shape: DynamicVector[Int]
     
     var data: DTypePointer[type]
-    var grads: DTypePointer[type] #TODO: gradients don't need the same type   
+    var grads: DTypePointer[type] #TODO: gradients don't need the same type       
 
     fn __init__(inout self, *dims: Int):
         let shape = __idx(dims)
@@ -88,7 +88,7 @@ struct Tensor[type: DType]:
         self.data = DTypePointer[type].alloc(self.size)
         self.grads = DTypePointer[type].alloc(self.size)
         memset_zero(self.data, self.size)
-        memset_zero(self.grads, self.size)
+        memset_zero(self.grads, self.size)    
     
     fn __init__(inout self, shape: DynamicVector[Int]):
         self.rank = len(shape)
@@ -362,8 +362,9 @@ struct Tensor[type: DType]:
     
     # Generic brodacast op method.  Supports following:    
     # TODO:
-    # - Clean! Very messy. Didn't find a way to pass an op as param or argument. Went for messy ifs and a fake enum. 
-    # - Important: change shape cheks to raise errors
+    # - Clean! Very messy. Didn't find a way to pass an op as param or argument. Went for 
+    # messy ifs and a fake enum. Relevant discussion: https://github.com/modularml/mojo/issues/271
+    # - Important: change shape checks to raise errors
     # - Add op name to error messages
     fn broadcast_op[op: Int](self: Self, rhs: Self) -> Self:
         """Utility fn to execute an operation _op_ with broadcast semantics. For reference 
@@ -664,4 +665,15 @@ struct Tensor[type: DType]:
     - backward needs:
     - - Every tensor needs to set it's backward if result of an OP
     - - Grads applies to each Value in data, 
+
+
+    For backward consider:
+    - either making Tensor register passable : remove the need for DynamicVector shape, 
+        (use either a customer register_passable struct, or a DimList)
+        - or making a TensorOpRef, that is very small (left, right, op) only, close to this
+        https://docs.modular.com/mojo/programming-manual.html#register_passable-struct-decorator
+        self may be unstable?
+    - Using Type erasure, pointers to Int, then bitcasting pointer to Tensor when using
+        - manually calling clean-up memory where needed (
+    - 
     """
