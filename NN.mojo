@@ -36,3 +36,58 @@ let b2 = Tensor[type](W2_size,1)
 
 #first output should be 32,10 (32 features for the 10 samples
 let z = linear_forward(input_data, W1, b1)
+
+@value
+@register_passable
+struct TensorRef:
+    var id: Int 
+    var op_ref: Pointer[Int]    
+    var data_ref: DTypePointer[type]
+    var grad_ref: DTypePointer[type]
+    #a reference to the operation that created this tensor
+    
+    fn __init__(inout tensor: Tensor, id: Int) -> Self:
+        #get the opref from the tensor
+        let p = tensor.op_ref.bitcast[Int]()
+        return Self(id, p, tensor.data, tensor.grads)
+
+@value
+@register_passable
+struct OpRef:
+    var op: Int
+    var left: TensorRef
+    var right: TensorRef
+    
+fn create_null_opref()-> Pointer[OpRef]:    
+    let null_tensor = TensorRef(-1, Pointer[Int].get_null(), DTypePointer[type].get_null(),  DTypePointer[type].get_null())
+    var op_ref = OpRef(-1, null_tensor, null_tensor)
+    return Pointer[OpRef].address_of(op_ref)
+
+@value
+struct BackPropHarness:
+    var cur_id: Int
+    var ops : DynamicVector[OpRef]
+    
+    fn __init__(inout self: Self):
+        self.cur_id = 0
+        self.ops = DynamicVector[OpRef]()
+        
+    fn __get_id(inout self: Self)-> Int:
+        self.cur_id+=1
+        return self.cur_id
+    
+    fn add_op(self: Self,  lhs: TensorRef,  rhs: TensorRef, op: Int) -> Pointer[OpRef]:
+        #let op_ref = OpRef(op, lhs, rhs)
+        #self.ops.push_back(op_ref)
+        return create_null_opref()
+    
+    fn backward(self: Self):
+        #get the last OpRef
+        #make sure it's a scalar
+        #build topo
+          #for every child reference
+        pass
+    
+
+#how to inject harness
+var harness = BackPropHarness()
